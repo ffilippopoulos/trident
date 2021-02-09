@@ -30,6 +30,7 @@ import (
 const (
 	iSCSIErrNoObjsFound                 = 21
 	iSCSIDeviceDiscoveryTimeoutSecs     = 90
+	lunMapDiscoveryTimeoutSecs          = 5
 	multipathDeviceDiscoveryTimeoutSecs = 90
 	resourceDeletionTimeoutSecs         = 40
 	fsRaw                               = "raw"
@@ -669,6 +670,34 @@ func getDeviceInfoForLUN(
 		return nil, err
 	} else if 0 == len(devices) {
 		return nil, fmt.Errorf("scan not completed for LUN %d on target %s", lunID, iSCSINodeName)
+	} else if len(devices) < len(hostSessionMap) {
+		// In case we have fewer devices than host sessions, allow some more time for the discovery
+		waitForMoreDevices := func() error {
+			devices, err = getDevicesForLUN(paths)
+			if err != nil {
+				return err
+			}
+			if len(devices) < len(hostSessionMap) {
+				return errors.New("Devices fewer than host sessions")
+			}
+			return nil
+		}
+		deviceNotify := func(err error, duration time.Duration) {
+			Logc(ctx).WithField("increment", duration).Debug("Devices less than sessions, waiting")
+		}
+		discoveryMaxDuration := lunMapDiscoveryTimeoutSecs * time.Second
+		deviceBackoff := backoff.NewExponentialBackOff()
+		deviceBackoff.InitialInterval = 1 * time.Second
+		deviceBackoff.Multiplier = 1.414 // approx sqrt(2)
+		deviceBackoff.RandomizationFactor = 0.1
+		deviceBackoff.MaxElapsedTime = discoveryMaxDuration
+
+		// Run the check/scan using an exponential backoff
+		if err := backoff.RetryNotify(waitForMoreDevices, deviceBackoff, deviceNotify); err != nil {
+			Logc(ctx).Warnf("Could not find more devices for LUN %d after %3.2f seconds.", lunID, discoveryMaxDuration.Seconds())
+		} else {
+			Logc(ctx).WithField("devices", devices).Debug("LUN target devices found.")
+		}
 	}
 
 	multipathDevice := ""
@@ -2401,7 +2430,7 @@ func getFSType(ctx context.Context, device string) (string, error) {
 		if unformatted, err := isDeviceUnformatted(ctx, device); err != nil {
 			Logc(ctx).WithFields(log.Fields{
 				"device": device,
-				"err": err,
+				"err":    err,
 			}).Debugf("Unable to identify if the device is not unformatted.")
 		} else if !unformatted {
 			Logc(ctx).WithField("device", device).Debugf("Device is not unformatted.")
