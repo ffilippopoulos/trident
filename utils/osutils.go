@@ -30,7 +30,7 @@ import (
 const (
 	iSCSIErrNoObjsFound                 = 21
 	iSCSIDeviceDiscoveryTimeoutSecs     = 90
-	lunMapDiscoveryTimeoutSecs          = 5
+	lunMapDiscoveryTimeoutSecs          = 90
 	multipathDeviceDiscoveryTimeoutSecs = 90
 	resourceDeletionTimeoutSecs         = 40
 	fsRaw                               = "raw"
