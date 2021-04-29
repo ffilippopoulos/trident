@@ -2672,7 +2672,7 @@ func Umount(ctx context.Context, mountpoint string) (err error) {
 // filterTargets parses the output of iscsiadm -m node or -m discoverydb -t st -D
 // and returns the target IQNs for a given portal
 func filterTargets(ctx context.Context, output, tp string) ([]string, error) {
-	regex := regexp.MustCompile(`^([^,]+),(\d+)\s+(.+)$`)
+	regex := regexp.MustCompile(`^([^,]+),(-?\d+)\s+(.+)$`)
 	targets := make([]string, 0)
 	for idx, line := range strings.Split(output, "\n") {
 		if 0 == len(line) {

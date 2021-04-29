@@ -32,6 +32,7 @@ const (
 	MinimumANFVolumeSizeBytes = 107374182400 // 100 GiB
 
 	defaultNfsMountOptions = "-o nfsvers=3"
+	defaultSnapshotDir     = "false"
 	defaultLimitVolumeSize = ""
 	defaultExportRule      = "0.0.0.0/0"
 	defaultVolumeSizeStr   = "107374182400"
@@ -42,6 +43,7 @@ const (
 	Cookie         = "cookie"
 	Size           = "size"
 	ServiceLevel   = "serviceLevel"
+	SnapshotDir    = "snapshotDir"
 	ExportRule     = "exportRule"
 	Location       = "location"
 	VirtualNetwork = "virtualNetwork"
@@ -252,6 +254,10 @@ func (d *NFSStorageDriver) populateConfigurationDefaults(
 		config.NfsMountOptions = defaultNfsMountOptions
 	}
 
+	if config.SnapshotDir == "" {
+		config.SnapshotDir = defaultSnapshotDir
+	}
+
 	if config.LimitVolumeSize == "" {
 		config.LimitVolumeSize = defaultLimitVolumeSize
 	}
@@ -264,6 +270,7 @@ func (d *NFSStorageDriver) populateConfigurationDefaults(
 		"Size":            config.Size,
 		"ServiceLevel":    config.ServiceLevel,
 		"NfsMountOptions": config.NfsMountOptions,
+		"SnapshotDir":     config.SnapshotDir,
 		"LimitVolumeSize": config.LimitVolumeSize,
 		"ExportRule":      config.ExportRule,
 	}).Debugf("Configuration defaults")
@@ -298,6 +305,7 @@ func (d *NFSStorageDriver) initializeStoragePools(ctx context.Context) error {
 
 		pool.InternalAttributes[Size] = d.Config.Size
 		pool.InternalAttributes[ServiceLevel] = strings.Title(d.Config.ServiceLevel)
+		pool.InternalAttributes[SnapshotDir] = d.Config.SnapshotDir
 		pool.InternalAttributes[ExportRule] = d.Config.ExportRule
 		pool.InternalAttributes[Location] = d.Config.Location
 		pool.InternalAttributes[VirtualNetwork] = d.Config.VirtualNetwork
@@ -343,6 +351,11 @@ func (d *NFSStorageDriver) initializeStoragePools(ctx context.Context) error {
 				serviceLevel = vpool.ServiceLevel
 			}
 
+			snapshotDir := d.Config.SnapshotDir
+			if vpool.SnapshotDir != "" {
+				snapshotDir = vpool.SnapshotDir
+			}
+
 			exportRule := d.Config.ExportRule
 			if vpool.ExportRule != "" {
 				exportRule = vpool.ExportRule
@@ -374,6 +387,7 @@ func (d *NFSStorageDriver) initializeStoragePools(ctx context.Context) error {
 
 			pool.InternalAttributes[Size] = size
 			pool.InternalAttributes[ServiceLevel] = strings.Title(serviceLevel)
+			pool.InternalAttributes[SnapshotDir] = snapshotDir
 			pool.InternalAttributes[ExportRule] = exportRule
 			pool.InternalAttributes[Location] = location
 			pool.InternalAttributes[VirtualNetwork] = vnet
@@ -477,6 +491,14 @@ func (d *NFSStorageDriver) validate(ctx context.Context) error {
 			}
 		}
 
+		// Validate snapshot dir
+		if pool.InternalAttributes[SnapshotDir] != "" {
+			_, err := strconv.ParseBool(pool.InternalAttributes[SnapshotDir])
+			if err != nil {
+				return fmt.Errorf("invalid value for snapshotDir in pool %s: %v", poolName, err)
+			}
+		}
+
 		// Validate default size
 		if _, err = utils.ConvertSizeToBytes(pool.InternalAttributes[Size]); err != nil {
 			return fmt.Errorf("invalid value for default volume size in pool %s: %v", poolName, err)
@@ -521,7 +543,7 @@ func (d *NFSStorageDriver) Create(
 	// If the volume already exists, bail out
 	volumeExists, extantVolume, err := d.SDK.VolumeExistsByCreationToken(ctx, name)
 	if err != nil {
-		return fmt.Errorf("error checking for existing volume: %v", err)
+		return fmt.Errorf("error checking for existing volume %s: %v", name, err)
 	}
 	if volumeExists {
 		if extantVolume.ProvisioningState == sdk.StateCreating {
@@ -578,6 +600,16 @@ func (d *NFSStorageDriver) Create(
 		serviceLevel = pool.InternalAttributes[ServiceLevel]
 	}
 
+	// Take snapshot directory from volume config first (handles Docker case), then from pool
+	snapshotDir := volConfig.SnapshotDir
+	if snapshotDir == "" {
+		snapshotDir = pool.InternalAttributes[SnapshotDir]
+	}
+	snapshotDirBool, err := strconv.ParseBool(snapshotDir)
+	if err != nil {
+		return fmt.Errorf("invalid value for snapshotDir: %v", err)
+	}
+
 	// Determine mount options (volume config wins, followed by backend config)
 	mountOptions := d.Config.NfsMountOptions
 	if volConfig.MountOptions != "" {
@@ -629,22 +661,24 @@ func (d *NFSStorageDriver) Create(
 		"creationToken": name,
 		"size":          sizeBytes,
 		"serviceLevel":  serviceLevel,
+		"snapshotDir":   snapshotDirBool,
 		"protocolTypes": protocolTypes,
 		"exportPolicy":  fmt.Sprintf("%+v", exportPolicy),
 	}).Debug("Creating volume.")
 
 	createRequest := &sdk.FilesystemCreateRequest{
-		Name:           volConfig.Name,
-		Location:       pool.InternalAttributes[Location],
-		VirtualNetwork: pool.InternalAttributes[VirtualNetwork],
-		Subnet:         pool.InternalAttributes[Subnet],
-		CreationToken:  name,
-		ExportPolicy:   exportPolicy,
-		Labels:         labels,
-		ProtocolTypes:  protocolTypes,
-		QuotaInBytes:   int64(sizeBytes),
-		ServiceLevel:   serviceLevel,
-		PoolID:         storagePool.Name,
+		Name:              volConfig.Name,
+		Location:          pool.InternalAttributes[Location],
+		VirtualNetwork:    pool.InternalAttributes[VirtualNetwork],
+		Subnet:            pool.InternalAttributes[Subnet],
+		CreationToken:     name,
+		ExportPolicy:      exportPolicy,
+		Labels:            labels,
+		PoolID:            storagePool.Name,
+		ProtocolTypes:     protocolTypes,
+		QuotaInBytes:      int64(sizeBytes),
+		ServiceLevel:      serviceLevel,
+		SnapshotDirectory: snapshotDirBool,
 	}
 
 	// Create the volume
@@ -692,7 +726,7 @@ func (d *NFSStorageDriver) CreateClone(
 	// If the volume already exists, bail out
 	volumeExists, extantVolume, err := d.SDK.VolumeExistsByCreationToken(ctx, name)
 	if err != nil {
-		return fmt.Errorf("error checking for existing volume: %v", err)
+		return fmt.Errorf("error checking for existing volume %s: %v", name, err)
 	}
 	if volumeExists {
 		if extantVolume.ProvisioningState == sdk.StateCreating {
@@ -782,18 +816,19 @@ func (d *NFSStorageDriver) CreateClone(
 	}
 
 	createRequest := &sdk.FilesystemCreateRequest{
-		Name:          volConfig.Name,
-		Location:      sourceVolume.Location,
-		CapacityPool:  sourceVolume.CapacityPoolName, // critical value for clone path
-		CreationToken: name,
-		ExportPolicy:  sourceVolume.ExportPolicy,
-		Labels:        d.updateTelemetryLabels(ctx, sourceVolume),
-		ProtocolTypes: sourceVolume.ProtocolTypes,
-		QuotaInBytes:  sourceVolume.QuotaInBytes,
-		ServiceLevel:  sourceVolume.ServiceLevel,
-		SnapshotID:    sourceSnapshot.SnapshotID,
-		PoolID:        *cookie.StoragePoolName,
-		Subnet:        sourceVolume.Subnet,
+		Name:              volConfig.Name,
+		Location:          sourceVolume.Location,
+		CapacityPool:      sourceVolume.CapacityPoolName, // critical value for clone path
+		Subnet:            sourceVolume.Subnet,
+		CreationToken:     name,
+		ExportPolicy:      sourceVolume.ExportPolicy,
+		Labels:            d.updateTelemetryLabels(ctx, sourceVolume),
+		PoolID:            *cookie.StoragePoolName,
+		ProtocolTypes:     sourceVolume.ProtocolTypes,
+		QuotaInBytes:      sourceVolume.QuotaInBytes,
+		ServiceLevel:      sourceVolume.ServiceLevel,
+		SnapshotDirectory: sourceVolume.SnapshotDirectory,
+		SnapshotID:        sourceSnapshot.SnapshotID,
 	}
 
 	// Clone the volume
@@ -953,9 +988,8 @@ func (d *NFSStorageDriver) Destroy(ctx context.Context, name string) error {
 	// If volume doesn't exist, return success
 	// 'name' is in fact 'creationToken' here.
 	volumeExists, extantVolume, err := d.SDK.VolumeExistsByCreationToken(ctx, name)
-
 	if err != nil {
-		return err
+		return fmt.Errorf("error checking for existing volume %s: %v", name, err)
 	}
 	if !volumeExists {
 		Logc(ctx).WithField("volume", name).Warn("Volume already deleted.")
@@ -1050,12 +1084,16 @@ func (d *NFSStorageDriver) GetSnapshot(ctx context.Context, snapConfig *storage.
 	// Get the volume
 	creationToken := internalVolName
 
-	volume, err := d.SDK.GetVolumeByCreationToken(ctx, creationToken)
+	volumeExists, extantVolume, err := d.SDK.VolumeExistsByCreationToken(ctx, creationToken)
 	if err != nil {
-		return nil, fmt.Errorf("could not find volume %s: %v", creationToken, err)
+		return nil, fmt.Errorf("error checking for existing volume %s: %v", creationToken, err)
+	}
+	if !volumeExists {
+		// The ANF volume is backed by ONTAP, so if the volume doesn't exist, neither does the snapshot.
+		return nil, nil
 	}
 
-	snapshots, err := d.SDK.GetSnapshotsForVolume(ctx, volume)
+	snapshots, err := d.SDK.GetSnapshotsForVolume(ctx, extantVolume)
 	if err != nil {
 		return nil, err
 	}
@@ -1074,7 +1112,7 @@ func (d *NFSStorageDriver) GetSnapshot(ctx context.Context, snapConfig *storage.
 			return &storage.Snapshot{
 				Config:    snapConfig,
 				Created:   created,
-				SizeBytes: volume.QuotaInBytes,
+				SizeBytes: extantVolume.QuotaInBytes,
 				State:     storage.SnapshotStateOnline,
 			}, nil
 		}
@@ -1166,7 +1204,7 @@ func (d *NFSStorageDriver) CreateSnapshot(ctx context.Context, snapConfig *stora
 	// Check if volume exists
 	volumeExists, sourceVolume, err := d.SDK.VolumeExistsByCreationToken(ctx, internalVolName)
 	if err != nil {
-		return nil, fmt.Errorf("error checking for existing volume: %v", err)
+		return nil, fmt.Errorf("error checking for existing volume %s: %v", internalVolName, err)
 	}
 	if !volumeExists {
 		return nil, fmt.Errorf("volume %s does not exist", internalVolName)
@@ -1253,23 +1291,27 @@ func (d *NFSStorageDriver) DeleteSnapshot(ctx context.Context, snapConfig *stora
 	// Get the volume
 	creationToken := internalVolName
 
-	volume, err := d.SDK.GetVolumeByCreationToken(ctx, creationToken)
+	volumeExists, extantVolume, err := d.SDK.VolumeExistsByCreationToken(ctx, creationToken)
 	if err != nil {
-		return fmt.Errorf("could not find volume %s: %v", creationToken, err)
+		return fmt.Errorf("error checking for existing volume %s: %v", creationToken, err)
+	}
+	if !volumeExists {
+		// The ANF volume is backed by ONTAP, so if the volume doesn't exist, neither does the snapshot.
+		return nil
 	}
 
-	snapshot, err := d.SDK.GetSnapshotForVolume(ctx, volume, internalSnapName)
+	snapshot, err := d.SDK.GetSnapshotForVolume(ctx, extantVolume, internalSnapName)
 	if err != nil {
 		return fmt.Errorf("unable to find snapshot %s: %v", internalSnapName, err)
 	}
 
-	if err = d.SDK.DeleteSnapshot(ctx, volume, snapshot); err != nil {
+	if err = d.SDK.DeleteSnapshot(ctx, extantVolume, snapshot); err != nil {
 		return err
 	}
 
 	// Wait for snapshot deletion to complete
 	if err := d.SDK.WaitForSnapshotState(
-		ctx, snapshot, volume, sdk.StateDeleted, []string{sdk.StateError}, sdk.SnapshotTimeout); err != nil {
+		ctx, snapshot, extantVolume, sdk.StateDeleted, []string{sdk.StateError}, sdk.SnapshotTimeout); err != nil {
 		return err
 	}
 
@@ -1545,7 +1587,7 @@ func (d *NFSStorageDriver) getVolumeExternal(volumeAttrs *sdk.FileSystem) *stora
 		Protocol:        tridentconfig.File,
 		SnapshotPolicy:  "",
 		ExportPolicy:    "",
-		SnapshotDir:     "true",
+		SnapshotDir:     strconv.FormatBool(volumeAttrs.SnapshotDirectory),
 		UnixPermissions: "",
 		StorageClass:    "",
 		AccessMode:      tridentconfig.ReadWriteMany,
